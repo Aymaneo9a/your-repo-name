@@ -1,0 +1,44 @@
+const CORS_PROXY = 'https://corsproxy.io/?';
+
+// All Claude calls go through our server-side Vercel function
+// The API key never touches the browser
+export async function callClaude(systemPrompt, userMessage, maxTokens = 1000) {
+  const response = await fetch('/api/claude', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'claude-sonnet-4-6',
+      max_tokens: maxTokens,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: userMessage }],
+    }),
+  });
+
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err?.error || `Server error ${response.status}`);
+  }
+
+  const data = await response.json();
+  return data.content?.[0]?.text || '';
+}
+
+export async function fetchKBArticle(url) {
+  try {
+    const proxyUrl = CORS_PROXY + encodeURIComponent(url);
+    const res = await fetch(proxyUrl);
+    if (!res.ok) throw new Error('Fetch failed');
+    const html = await res.text();
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(html, 'text/html');
+    ['script', 'style', 'nav', 'header', 'footer', '.breadcrumb'].forEach(sel => {
+      doc.querySelectorAll(sel).forEach(el => el.remove());
+    });
+    const main = doc.querySelector('main, article, .content, #content, body');
+    return main?.innerText?.slice(0, 4000) || '';
+  } catch (e) {
+    return null;
+  }
+}
+
+export const SYSTEM_PROMPT = `You are an expert Broadcom Symantec support engineer AI assistant with deep knowledge of Cloud SWG, ProxySG/Edge SWG, Content Analysis, ZTNA, and Management Center. Analyze logs, cross-reference documentation, generate structured RCAs, propose resolutions, and draft professional customer communications. Always cite specific log lines or documentation sections. For RCAs respond only in JSON: { "summary":"", "rootCause":"", "timeline":"", "evidence":"", "resolution":"", "kbRef":"" }`;

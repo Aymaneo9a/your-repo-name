@@ -1,0 +1,195 @@
+import React, { useState } from 'react';
+import { PRODUCTS, KB_URLS } from '../data/constants';
+import { fetchKBArticle } from '../data/api';
+import './KnowledgeView.css';
+
+export default function KnowledgeView({ kb, setKb, onIntel }) {
+  const [url, setUrl] = useState('');
+  const [fetching, setFetching] = useState(false);
+  const [note, setNote] = useState('');
+  const [noteTitle, setNoteTitle] = useState('');
+  const [noteProduct, setNoteProduct] = useState('ProxySG');
+  const [activeProduct, setActiveProduct] = useState('all');
+
+  async function fetchUrl() {
+    if (!url.trim()) return;
+    setFetching(true);
+    try {
+      const content = await fetchKBArticle(url);
+      const entry = {
+        id: Date.now(),
+        type: 'url',
+        title: url.split('/').pop() || url,
+        url,
+        content: content || '(Content could not be fetched — URL saved for reference)',
+        product: detectProduct(url),
+        added: new Date().toLocaleDateString(),
+      };
+      setKb(prev => [entry, ...prev]);
+      setUrl('');
+      onIntel(`KB article indexed: ${entry.title}`, 'ti-book', '#1D9E75');
+    } catch (e) {
+      onIntel('KB fetch failed — check URL and network', 'ti-alert-circle', '#A32D2D');
+    }
+    setFetching(false);
+  }
+
+  function detectProduct(str) {
+    const s = str.toLowerCase();
+    if (s.includes('swg') || s.includes('cloud')) return 'Cloud SWG';
+    if (s.includes('proxy') || s.includes('edge')) return 'ProxySG';
+    if (s.includes('content') || s.includes('cas')) return 'Content Analysis';
+    if (s.includes('ztna')) return 'ZTNA';
+    if (s.includes('management') || s.includes('mc')) return 'Management Center';
+    return 'General';
+  }
+
+  function addNote() {
+    if (!noteTitle.trim() || !note.trim()) return;
+    const entry = {
+      id: Date.now(),
+      type: 'note',
+      title: noteTitle,
+      content: note,
+      product: noteProduct,
+      added: new Date().toLocaleDateString(),
+    };
+    setKb(prev => [entry, ...prev]);
+    setNoteTitle(''); setNote('');
+    onIntel(`Knowledge note added: ${noteTitle}`, 'ti-note', '#534AB7');
+  }
+
+  function removeEntry(id) {
+    setKb(prev => prev.filter(e => e.id !== id));
+  }
+
+  const filtered = activeProduct === 'all' ? kb : kb.filter(e => e.product === activeProduct);
+  const productNames = ['all', ...Object.keys(PRODUCTS)];
+
+  return (
+    <div className="kb-view">
+      <div className="kb-header">
+        <div>
+          <h2>Knowledge Base</h2>
+          <p style={{ fontSize: 13, color: 'var(--text-2)', marginTop: 3 }}>
+            Index Broadcom KB articles and add your own notes — the AI uses this during log analysis and RCA generation.
+          </p>
+        </div>
+      </div>
+
+      <div className="kb-body">
+        <div className="kb-left">
+
+          {/* Quick links */}
+          <div className="section-card">
+            <div className="section-head">
+              <div className="section-head-left"><i className="ti ti-link section-icon" /><span className="section-label">Broadcom official docs</span></div>
+            </div>
+            <div className="section-body">
+              <p style={{ fontSize: 12, color: 'var(--text-2)', marginBottom: 10 }}>Click to add any official doc to your knowledge base:</p>
+              {Object.entries(KB_URLS).map(([product, docUrl]) => (
+                <div key={product} className="kb-quicklink" onClick={() => setUrl(docUrl)}>
+                  <span className={`product-tag ${PRODUCTS[product].cls}`}>{product}</span>
+                  <span className="kql-url">{docUrl.replace('https://','')}</span>
+                  <i className="ti ti-plus" style={{ color: 'var(--teal)', fontSize: 14 }} />
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* URL fetch */}
+          <div className="section-card">
+            <div className="section-head">
+              <div className="section-head-left"><i className="ti ti-world section-icon" /><span className="section-label">Fetch KB article by URL</span></div>
+            </div>
+            <div className="section-body">
+              <div style={{ display: 'flex', gap: 8 }}>
+                <input
+                  className="form-input"
+                  style={{ flex: 1 }}
+                  placeholder="https://knowledge.broadcom.com/external/article/..."
+                  value={url}
+                  onChange={e => setUrl(e.target.value)}
+                  onKeyDown={e => e.key === 'Enter' && fetchUrl()}
+                />
+                <button className="btn btn-primary" onClick={fetchUrl} disabled={fetching || !url.trim()}>
+                  <i className={`ti ${fetching ? 'ti-loader spin' : 'ti-download'}`} />
+                  {fetching ? 'Fetching...' : 'Fetch'}
+                </button>
+              </div>
+              <p style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6 }}>
+                Paste any public Broadcom TechDocs or knowledge.broadcom.com URL — content is indexed automatically.
+              </p>
+            </div>
+          </div>
+
+          {/* Manual note */}
+          <div className="section-card">
+            <div className="section-head">
+              <div className="section-head-left"><i className="ti ti-note section-icon" /><span className="section-label">Add manual note</span></div>
+            </div>
+            <div className="section-body">
+              <div className="form-group">
+                <label className="form-label">Title</label>
+                <input className="form-input" placeholder="e.g. ProxySG SSL intercept quirks" value={noteTitle} onChange={e => setNoteTitle(e.target.value)} />
+              </div>
+              <div className="form-group">
+                <label className="form-label">Product</label>
+                <select className="form-select" value={noteProduct} onChange={e => setNoteProduct(e.target.value)}>
+                  {Object.keys(PRODUCTS).map(p => <option key={p}>{p}</option>)}
+                </select>
+              </div>
+              <div className="form-group">
+                <label className="form-label">Content</label>
+                <textarea className="form-textarea" style={{ minHeight: 100 }} placeholder="Your notes, solutions, or workarounds..." value={note} onChange={e => setNote(e.target.value)} />
+              </div>
+              <button className="btn btn-primary" onClick={addNote} disabled={!noteTitle.trim() || !note.trim()}>
+                <i className="ti ti-plus" /> Add to knowledge base
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div className="kb-right">
+          <div className="kb-filter-row">
+            {productNames.map(p => (
+              <button
+                key={p}
+                className={`kb-filter-btn${activeProduct === p ? ' active' : ''}`}
+                onClick={() => setActiveProduct(p)}
+              >
+                {p === 'all' ? `All (${kb.length})` : p}
+              </button>
+            ))}
+          </div>
+
+          {filtered.length === 0 ? (
+            <div className="empty-state" style={{ height: 300 }}>
+              <i className="ti ti-books" />
+              <p>No knowledge entries yet</p>
+              <small>Fetch a Broadcom KB article or add a manual note</small>
+            </div>
+          ) : (
+            filtered.map(entry => (
+              <div className="kb-entry" key={entry.id}>
+                <div className="kbe-head">
+                  <i className={`ti ${entry.type === 'url' ? 'ti-world' : 'ti-note'} kbe-icon`} style={{ color: entry.type === 'url' ? '#185FA5' : '#534AB7' }} />
+                  <span className="kbe-title">{entry.title}</span>
+                  <span className={`product-tag ${PRODUCTS[entry.product]?.cls || 'tag-swg'}`} style={{ marginLeft: 'auto' }}>{entry.product}</span>
+                  <button className="btn btn-icon btn-sm" onClick={() => removeEntry(entry.id)} style={{ color: 'var(--text-3)' }}>
+                    <i className="ti ti-trash" />
+                  </button>
+                </div>
+                {entry.url && (
+                  <a href={entry.url} target="_blank" rel="noreferrer" className="kbe-url">{entry.url}</a>
+                )}
+                <p className="kbe-preview">{entry.content?.slice(0, 180)}...</p>
+                <span className="kbe-date">Added {entry.added}</span>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

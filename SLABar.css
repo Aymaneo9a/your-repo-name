@@ -1,0 +1,413 @@
+import React, { useState, useRef } from 'react';
+import { runInvestigation, preParseHAR, extractELFFFields } from '../data/pipeline';
+import { ARTIFACT_LABELS, EVIDENCE_REQUIREMENTS } from '../data/methodology';
+import './InvestigationPanel.css';
+
+const STAGE_LABELS = {
+  triage:      { icon: 'ti-clipboard-list',    label: 'Triage' },
+  kb:          { icon: 'ti-book',              label: 'KB Fetch' },
+  preprocess:  { icon: 'ti-filter',            label: 'Pre-processing' },
+  evidence:    { icon: 'ti-search',            label: 'Evidence Extraction' },
+  missing:     { icon: 'ti-alert-triangle',    label: 'Missing Evidence Check' },
+  hypotheses:  { icon: 'ti-git-branch',        label: 'Hypothesis Generation' },
+  validation:  { icon: 'ti-checkup-list',      label: 'Hypothesis Validation' },
+  rca:         { icon: 'ti-report-analytics',  label: 'RCA Generation' },
+  gate:        { icon: 'ti-shield-check',      label: 'Quality Gate' },
+  done:        { icon: 'ti-circle-check',      label: 'Complete' },
+};
+
+const CONFIDENCE_COLOR = (pct) => {
+  if (pct >= 90) return '#3B6D11';
+  if (pct >= 70) return '#1D9E75';
+  if (pct >= 50) return '#BA7517';
+  return '#A32D2D';
+};
+
+const GRADE_COLOR = { A: '#3B6D11', B: '#1D9E75', C: '#BA7517', FAIL: '#A32D2D' };
+
+export default function InvestigationPanel({ ticket, onIntel, onUpdateTicket }) {
+  const [artifacts, setArtifacts] = useState({});
+  const [running, setRunning] = useState(false);
+  const [progress, setProgress] = useState(null);
+  const [investigation, setInvestigation] = useState(ticket?.investigation || null);
+  const [activeSection, setActiveSection] = useState('artifacts');
+  const fileRefs = useRef({});
+
+  React.useEffect(() => {
+    setArtifacts({});
+    setInvestigation(ticket?.investigation || null);
+    setProgress(null);
+    setActiveSection('artifacts');
+  }, [ticket?.id]);
+
+  function handleFileUpload(artifactKey, e) {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    // HAR size check
+    if (artifactKey === 'harTrace' && file.size > 3 * 1024 * 1024) {
+      alert('HAR file exceeds 3MB limit. Please trim it and re-upload.');
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      const content = ev.target.result;
+      setArtifacts(prev => ({
+        ...prev,
+        [artifactKey]: { name: file.name, content, size: file.size }
+      }));
+      onIntel(`Artifact loaded: ${file.name} → ${ARTIFACT_LABELS[artifactKey]?.label}`, 'ti-file-upload', '#185FA5');
+    };
+    reader.readAsText(file);
+  }
+
+  async function startInvestigation() {
+    if (!ticket) return;
+    setRunning(true);
+    setInvestigation(null);
+    setActiveSection('progress');
+
+    const result = await runInvestigation(
+      ticket,
+      artifacts,
+      (prog) => setProgress(prog)
+    );
+
+    setInvestigation(result);
+    setRunning(false);
+    setActiveSection('results');
+    onUpdateTicket(ticket.id, { investigation: result, rca: result.stages?.rca });
+    onIntel(
+      `T3 Investigation complete for ${ticket.id} — ${result.stages?.qualityGate?.grade || '?'} grade, ${result.stages?.rca?.confidence || 0}% confidence`,
+      'ti-report-analytics',
+      result.status === 'complete' ? '#3B6D11' : '#BA7517'
+    );
+  }
+
+  const req = EVIDENCE_REQUIREMENTS[investigation?.stages?.triage?.category || 'AGENT_TUNNEL'];
+  const triage = investigation?.stages?.triage;
+  const evidence = investigation?.stages?.evidence;
+  const missing = investigation?.stages?.missingEvidence;
+  const hyps = investigation?.stages?.hypotheses;
+  const validation = investigation?.stages?.validation;
+  const rca = investigation?.stages?.rca;
+  const gate = investigation?.stages?.qualityGate;
+
+  return (
+    <div className="inv-panel">
+
+      {/* Section tabs */}
+      <div className="tab-row">
+        {[
+          { id: 'artifacts', label: 'Evidence Upload', icon: 'ti-upload' },
+          { id: 'progress',  label: 'Pipeline',        icon: 'ti-cpu' },
+          { id: 'results',   label: 'Investigation',   icon: 'ti-report-analytics' },
+        ].map(t => (
+          <div key={t.id} className={`tab${activeSection === t.id ? ' active' : ''}`} onClick={() => setActiveSection(t.id)}>
+            <i className={`ti ${t.icon}`} /> {t.label}
+          </div>
+        ))}
+      </div>
+
+      <div className="inv-body">
+
+        {/* ARTIFACTS UPLOAD */}
+        {activeSection === 'artifacts' && (
+          <div className="animate-in">
+            <div className="section-card">
+              <div className="section-head">
+                <div className="section-head-left">
+                  <i className="ti ti-upload section-icon" />
+                  <span className="section-label">Upload Evidence Artifacts</span>
+                </div>
+              </div>
+              <div className="section-body">
+                <p style={{ fontSize: 12, color: 'var(--text-2)', marginBottom: 12 }}>
+                  Upload all available evidence. The pipeline will determine what's required based on the symptom category detected during triage.
+                </p>
+                {Object.entries(ARTIFACT_LABELS).map(([key, meta]) => (
+                  <div key={key} className="artifact-row">
+                    <div className="artifact-info">
+                      <span className="artifact-label">{meta.label}</span>
+                      <span className="artifact-ext">{meta.ext.join(', ')}</span>
+                      {key === 'harTrace' && <span className="artifact-limit">max 3MB</span>}
+                    </div>
+                    <div className="artifact-action">
+                      {artifacts[key] ? (
+                        <div className="artifact-loaded">
+                          <i className="ti ti-file-check" style={{ color: 'var(--teal)' }} />
+                          <span>{artifacts[key].name}</span>
+                          <button className="btn btn-icon btn-sm" onClick={() => setArtifacts(p => { const n = {...p}; delete n[key]; return n; })}>
+                            <i className="ti ti-x" style={{ fontSize: 12 }} />
+                          </button>
+                        </div>
+                      ) : (
+                        <>
+                          <input
+                            type="file"
+                            accept={meta.ext.join(',')}
+                            style={{ display: 'none' }}
+                            ref={el => fileRefs.current[key] = el}
+                            onChange={e => handleFileUpload(key, e)}
+                          />
+                          <button className="btn btn-sm" onClick={() => fileRefs.current[key]?.click()}>
+                            <i className="ti ti-upload" /> Upload
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <button
+              className="btn btn-primary"
+              style={{ width: '100%', justifyContent: 'center', padding: '10px' }}
+              onClick={() => { startInvestigation(); }}
+              disabled={running}
+            >
+              <i className="ti ti-cpu" />
+              Start T3 Investigation Pipeline
+            </button>
+            <p style={{ fontSize: 11, color: 'var(--text-3)', textAlign: 'center', marginTop: 6 }}>
+              Runs 7 staged AI analysis steps · Haiku + Sonnet tiered for efficiency
+            </p>
+          </div>
+        )}
+
+        {/* PIPELINE PROGRESS */}
+        {activeSection === 'progress' && (
+          <div className="animate-in">
+            <div className="section-card">
+              <div className="section-head">
+                <div className="section-head-left"><i className="ti ti-cpu section-icon" /><span className="section-label">Investigation Pipeline</span></div>
+                {running && <span style={{ fontSize: 11, color: 'var(--teal)' }}>Running...</span>}
+              </div>
+              <div className="section-body">
+                {/* Progress bar */}
+                {progress && (
+                  <div style={{ marginBottom: 16 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 4 }}>
+                      <span style={{ fontSize: 12, color: 'var(--text-2)' }}>{progress.label}</span>
+                      <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--teal)' }}>{progress.pct}%</span>
+                    </div>
+                    <div style={{ height: 6, background: 'var(--surface-3)', borderRadius: 3, overflow: 'hidden' }}>
+                      <div style={{ height: '100%', width: `${progress.pct}%`, background: 'var(--teal)', borderRadius: 3, transition: 'width 0.4s ease' }} />
+                    </div>
+                  </div>
+                )}
+
+                {/* Stage indicators */}
+                {Object.entries(STAGE_LABELS).map(([key, meta]) => {
+                  const isDone = investigation?.stages?.[key] || (!running && progress?.stage === 'done');
+                  const isCurrent = progress?.stage === key && running;
+                  return (
+                    <div key={key} className={`pipeline-stage ${isDone ? 'done' : ''} ${isCurrent ? 'active' : ''}`}>
+                      <i className={`ti ${meta.icon} stage-icon`} />
+                      <span className="stage-label">{meta.label}</span>
+                      {isDone && <i className="ti ti-check" style={{ marginLeft: 'auto', color: 'var(--teal)', fontSize: 13 }} />}
+                      {isCurrent && <span className="dots" style={{ marginLeft: 'auto' }}><span>.</span><span>.</span><span>.</span></span>}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* INVESTIGATION RESULTS */}
+        {activeSection === 'results' && investigation && (
+          <div className="animate-in">
+
+            {/* Quality gate badge */}
+            {gate && (
+              <div className="quality-gate-banner" style={{ borderColor: GRADE_COLOR[gate.grade] }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <span className="gate-grade" style={{ background: GRADE_COLOR[gate.grade] }}>{gate.grade}</span>
+                  <div>
+                    <div style={{ fontSize: 13, fontWeight: 600 }}>{gate.recommendation}</div>
+                    <div style={{ fontSize: 11, color: 'var(--text-2)' }}>
+                      {Object.entries(gate.checks || {}).filter(([,v]) => v).length} / {Object.keys(gate.checks || {}).length} quality checks passed
+                    </div>
+                  </div>
+                  {rca?.confidence && (
+                    <div style={{ marginLeft: 'auto', textAlign: 'right' }}>
+                      <div style={{ fontSize: 20, fontWeight: 700, color: CONFIDENCE_COLOR(rca.confidence) }}>{rca.confidence}%</div>
+                      <div style={{ fontSize: 10, color: 'var(--text-3)' }}>confidence</div>
+                    </div>
+                  )}
+                </div>
+                {gate.failReasons?.length > 0 && (
+                  <div style={{ marginTop: 8, fontSize: 12, color: '#A32D2D' }}>
+                    {gate.failReasons.map((r, i) => <div key={i}>⚠ {r}</div>)}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Triage result */}
+            {triage && (
+              <div className="section-card">
+                <div className="section-head">
+                  <div className="section-head-left"><i className="ti ti-clipboard-list section-icon" /><span className="section-label">Triage</span></div>
+                  <span className="inv-badge inv-badge-blue">{triage.category?.replace('_', ' ')}</span>
+                </div>
+                <div className="section-body">
+                  <div className="inv-grid">
+                    <div className="inv-field"><span className="inv-field-label">Access Method</span><span>{triage.accessMethod}</span></div>
+                    <div className="inv-field"><span className="inv-field-label">Scope</span><span>{triage.affectedScope}</span></div>
+                    <div className="inv-field"><span className="inv-field-label">Intermittent</span><span>{triage.isIntermittent ? 'Yes' : 'No'}</span></div>
+                    <div className="inv-field"><span className="inv-field-label">Version Detected</span><span>{triage.agentVersion || 'Not detected'}</span></div>
+                  </div>
+                  {triage.symptoms?.length > 0 && (
+                    <div style={{ marginTop: 8 }}>
+                      <div style={{ fontSize: 11, color: 'var(--text-3)', marginBottom: 4 }}>SYMPTOMS</div>
+                      {triage.symptoms.map((s, i) => <div key={i} style={{ fontSize: 12, padding: '2px 0' }}>• {s}</div>)}
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Missing evidence */}
+            {missing && (missing.missingArtifacts?.length > 0 || missing.unusableArtifacts?.length > 0) && (
+              <div className="section-card" style={{ borderColor: '#f5c6c6' }}>
+                <div className="section-head" style={{ background: '#FCEBEB' }}>
+                  <div className="section-head-left"><i className="ti ti-alert-triangle section-icon" style={{ color: '#A32D2D' }} /><span className="section-label">Missing / Unusable Evidence</span></div>
+                  <span className="inv-badge" style={{ background: '#FCEBEB', color: '#A32D2D' }}>
+                    {missing.investigationStatus}
+                  </span>
+                </div>
+                <div className="section-body">
+                  {missing.missingArtifacts?.map((a, i) => (
+                    <div key={i} className="missing-artifact">
+                      <div style={{ fontWeight: 600, fontSize: 13 }}>{a.artifact}</div>
+                      <div style={{ fontSize: 12, color: 'var(--text-2)' }}>{a.why}</div>
+                      <div style={{ fontSize: 12, color: 'var(--teal)', marginTop: 4 }}>📋 {a.howToCollect}</div>
+                    </div>
+                  ))}
+                  {missing.unusableArtifacts?.map((a, i) => (
+                    <div key={i} className="missing-artifact" style={{ borderLeftColor: '#BA7517' }}>
+                      <div style={{ fontWeight: 600, fontSize: 13 }}>{a.artifact} — {a.issue}</div>
+                      <div style={{ fontSize: 12, color: 'var(--teal)', marginTop: 4 }}>🔄 {a.fix}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Evidence facts */}
+            {evidence?.extractedFacts?.length > 0 && (
+              <div className="section-card">
+                <div className="section-head">
+                  <div className="section-head-left"><i className="ti ti-search section-icon" /><span className="section-label">Extracted Evidence ({evidence.extractedFacts.length} facts)</span></div>
+                </div>
+                <div className="section-body">
+                  {['ENDPOINT','NETWORK','AUTH','POLICY'].map(layer => {
+                    const layerFacts = evidence.extractedFacts.filter(f => f.layer === layer);
+                    if (!layerFacts.length) return null;
+                    return (
+                      <div key={layer} style={{ marginBottom: 12 }}>
+                        <div style={{ fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--text-3)', marginBottom: 6 }}>{layer} LAYER</div>
+                        {layerFacts.map((f, i) => (
+                          <div key={i} className="evidence-fact">
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                              <span className={`relevance-badge rel-${f.relevance?.toLowerCase()}`}>{f.relevance}</span>
+                              <span style={{ fontSize: 13 }}>{f.fact}</span>
+                            </div>
+                            <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
+                              <i className="ti ti-file-text" style={{ fontSize: 11 }} /> {f.source} — {f.logRef}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Hypotheses */}
+            {hyps?.hypotheses?.length > 0 && (
+              <div className="section-card">
+                <div className="section-head">
+                  <div className="section-head-left"><i className="ti ti-git-branch section-icon" /><span className="section-label">Hypotheses</span></div>
+                </div>
+                <div className="section-body">
+                  {hyps.hypotheses.map(h => {
+                    const validated = validation?.validatedHypotheses?.find(v => v.id === h.id);
+                    return (
+                      <div key={h.id} className={`hypothesis-card ${h.id === hyps.primaryHypothesis ? 'primary' : ''}`}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                          <span style={{ fontWeight: 700, fontSize: 12, color: 'var(--teal)' }}>{h.id}</span>
+                          <span className={`layer-badge layer-${h.layer?.toLowerCase()}`}>{h.layer}</span>
+                          {h.id === hyps.primaryHypothesis && <span style={{ fontSize: 11, background: '#EAF3DE', color: '#27500A', padding: '1px 6px', borderRadius: 4 }}>PRIMARY</span>}
+                          <span style={{ marginLeft: 'auto', fontSize: 13, fontWeight: 700, color: CONFIDENCE_COLOR(validated?.adjustedConfidence || h.confidence) }}>
+                            {validated?.adjustedConfidence || h.confidence}%
+                          </span>
+                        </div>
+                        <div style={{ fontSize: 13, marginBottom: 6 }}>{h.hypothesis}</div>
+                        {validated && (
+                          <div style={{ fontSize: 11, padding: '4px 8px', borderRadius: 4, background: validated.verdict === 'CONFIRMED' ? '#EAF3DE' : validated.verdict === 'RULED_OUT' ? '#FCEBEB' : '#FAEEDA', color: validated.verdict === 'CONFIRMED' ? '#27500A' : validated.verdict === 'RULED_OUT' ? '#A32D2D' : '#633806' }}>
+                            {validated.verdict}
+                            {validated.contradictions?.length > 0 && ` — contradiction: ${validated.contradictions[0]}`}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* RCA */}
+            {rca && (
+              <div className="section-card">
+                <div className="section-head">
+                  <div className="section-head-left"><i className="ti ti-report-analytics section-icon" /><span className="section-label">Root Cause Analysis</span></div>
+                  {rca.draft && <span className="inv-badge" style={{ background: '#FAEEDA', color: '#633806' }}>DRAFT</span>}
+                  {rca.escalateToDefect && <span className="inv-badge" style={{ background: '#FCEBEB', color: '#A32D2D' }}>ESCALATE TO DEFECT</span>}
+                </div>
+                <div className="section-body">
+                  {rca.status === 'INCOMPLETE' ? (
+                    <div style={{ padding: 12, background: '#FCEBEB', borderRadius: 8, fontSize: 13, color: '#A32D2D' }}>
+                      <strong>Investigation Incomplete</strong><br />{rca.reason}
+                    </div>
+                  ) : (
+                    <>
+                      {[
+                        { label: 'Summary',                val: rca.summary },
+                        { label: 'Root Cause',             val: rca.rootCause },
+                        { label: 'Timeline',               val: rca.timeline,              mono: true },
+                        { label: 'Evidence',               val: rca.evidence },
+                        { label: 'Alternatives Evaluated', val: rca.alternativesEvaluated },
+                        { label: 'Resolution Steps',       val: rca.resolution,            mono: true },
+                        { label: 'Validation',             val: rca.validation },
+                        { label: 'Prevention',             val: rca.preventionSteps },
+                        { label: 'KB Reference',           val: rca.kbRef },
+                      ].filter(r => r.val).map(r => (
+                        <div className="rca-block" key={r.label}>
+                          <div className="rca-label">{r.label}</div>
+                          <div className={`rca-content${r.mono ? ' mono' : ''}`} style={{ whiteSpace: 'pre-wrap' }}>{r.val}</div>
+                        </div>
+                      ))}
+                      {rca.escalateToDefect && (
+                        <div style={{ marginTop: 10, padding: 10, background: '#FCEBEB', borderRadius: 8, fontSize: 12, color: '#A32D2D', borderLeft: '3px solid #A32D2D' }}>
+                          <strong>⚠ Potential Product Defect</strong><br />{rca.escalationReason}
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}

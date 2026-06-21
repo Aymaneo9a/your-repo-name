@@ -1,0 +1,68 @@
+import React, { useState } from 'react';
+import { clearAll } from '../data/storage';
+
+export default function SettingsModal({ settings, onSave, onClose }) {
+  const [form, setForm] = useState({ ...settings });
+
+  function set(k, v) { setForm(p => ({ ...p, [k]: v })); }
+
+  function handleClearData() {
+    if (window.confirm('This will clear all tickets, KPI data and settings. Are you sure?')) {
+      clearAll();
+      window.location.reload();
+    }
+  }
+
+  return (
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
+      <div className="modal">
+        <div className="modal-head">
+          <span className="modal-title">Settings</span>
+          <button className="modal-close" onClick={onClose}><i className="ti ti-x" /></button>
+        </div>
+        <div className="modal-body">
+
+          <div style={{ background: '#EAF3DE', border: '0.5px solid #b8d89e', borderRadius: 8, padding: '10px 14px', marginBottom: 16, fontSize: 13 }}>
+            <i className="ti ti-shield-check" style={{ color: '#3B6D11', marginRight: 6 }} />
+            <strong>Secure:</strong> Your Claude API key is stored as a Vercel environment variable — never in your browser or visible to anyone.
+          </div>
+
+          <div className="form-group">
+            <label className="form-label">
+              <i className="ti ti-folder" style={{ marginRight: 5 }} />
+              PDF documentation folder path
+            </label>
+            <input
+              className="form-input"
+              placeholder="e.g. /Users/you/broadcom-docs"
+              value={form.pdfFolder || ''}
+              onChange={e => set('pdfFolder', e.target.value)}
+            />
+            <p style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6 }}>
+              Path to your Broadcom PDF admin guides folder. Referenced during RCA generation.
+            </p>
+          </div>
+
+          <hr className="divider" />
+
+          <div className="form-group">
+            <label className="form-label" style={{ color: '#A32D2D' }}>Danger zone</label>
+            <button className="btn btn-danger btn-sm" onClick={handleClearData}>
+              <i className="ti ti-trash" /> Clear all data & reset
+            </button>
+            <p style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6 }}>
+              Clears all tickets, KPI history, knowledge base and settings from local storage.
+            </p>
+          </div>
+
+          <div className="btn-row" style={{ marginTop: 8 }}>
+            <button className="btn btn-primary" onClick={() => onSave(form)}>
+              <i className="ti ti-check" /> Save
+            </button>
+            <button className="btn" onClick={onClose}>Cancel</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

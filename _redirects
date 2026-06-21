@@ -1,0 +1,454 @@
+// Investigation Pipeline Orchestrator
+// Staged reasoning: Triage → Evidence → Hypotheses → Validation → RCA → Quality Gate
+// Model tiering: Haiku for mechanical stages, Sonnet for reasoning stages
+
+import { CLOUD_SWG_METHODOLOGY, EVIDENCE_REQUIREMENTS, KB_SEARCH_URLS } from './methodology';
+import { fetchKBArticle } from './api';
+
+const HAIKU  = 'claude-haiku-4-5-20251001';
+const SONNET = 'claude-sonnet-4-6';
+
+// ── Core API call (uses server-side proxy) ─────────────────────────────────
+async function ai(model, system, user, maxTokens = 800) {
+  const res = await fetch('/api/claude', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model,
+      max_tokens: maxTokens,
+      system,
+      messages: [{ role: 'user', content: user }],
+    }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err?.error || `API error ${res.status}`);
+  }
+  const data = await res.json();
+  return data.content?.[0]?.text || '';
+}
+
+function parseJSON(raw) {
+  try {
+    return JSON.parse(raw.replace(/```json|```/g, '').trim());
+  } catch {
+    return null;
+  }
+}
+
+// ── HAR pre-parser (code-level, zero tokens) ───────────────────────────────
+export function preParseHAR(harText, maxBytes = 2.5 * 1024 * 1024) {
+  if (harText.length > maxBytes) {
+    harText = harText.slice(0, maxBytes);
+  }
+  try {
+    const har = JSON.parse(harText);
+    const entries = har?.log?.entries || [];
+    // Extract only failed requests, redirects, and auth-related entries
+    const relevant = entries.filter(e => {
+      const status = e?.response?.status;
+      const url = e?.request?.url || '';
+      return (
+        status >= 300 ||
+        url.includes('saml') ||
+        url.includes('auth') ||
+        url.includes('login') ||
+        url.includes('sso') ||
+        url.includes('swg') ||
+        url.includes('proxy')
+      );
+    }).slice(0, 50); // Cap at 50 entries
+
+    return relevant.map(e => ({
+      url: e?.request?.url,
+      method: e?.request?.method,
+      status: e?.response?.status,
+      statusText: e?.response?.statusText,
+      timings: e?.timings,
+      responseHeaders: e?.response?.headers?.slice(0, 5),
+    }));
+  } catch {
+    return [{ raw: harText.slice(0, 3000) }];
+  }
+}
+
+// ── ELFF log extractor (code-level, zero tokens) ───────────────────────────
+export function extractELFFFields(logText) {
+  const lines = logText.split('\n').filter(l => l.trim() && !l.startsWith('#'));
+  const keyFields = ['action-result', 'cs-host', 'cs-uri-categories', 'cs-threat-risk',
+    'x-bluecoat-application-name', 'sc-bytes', 'time-taken', 'DENIED', 'FAILED', 'ERROR'];
+  const relevant = lines.filter(line =>
+    keyFields.some(f => line.toLowerCase().includes(f.toLowerCase()))
+  ).slice(0, 100);
+  return relevant.join('\n');
+}
+
+// ── Stage 1: TRIAGE (Haiku — cheap classification) ─────────────────────────
+export async function stageTriage(ticket) {
+  const prompt = `Analyze this support ticket and return JSON only:
+{
+  "category": "AGENT_TUNNEL|AUTH_SAML|POLICY_BYPASS|SSL_INTERCEPT",
+  "accessMethod": "WSS_AGENT|PAC|IPSEC|GRE|SEP|UNKNOWN",
+  "affectedScope": "user|group|location|global",
+  "isIntermittent": true|false,
+  "agentVersion": "string or null",
+  "symptoms": ["list", "of", "key", "symptoms"],
+  "errorCodes": ["any error codes mentioned"],
+  "triggerKBFetch": true|false,
+  "kbFetchReason": "reason or null"
+}
+
+Ticket subject: ${ticket.subject}
+Customer: ${ticket.customer} at ${ticket.company}
+Description: ${ticket.description}
+Conversation history: ${ticket.conversation.map(c => `${c.sender}: ${c.text}`).join('\n')}`;
+
+  const raw = await ai(HAIKU, CLOUD_SWG_METHODOLOGY, prompt, 400);
+  return parseJSON(raw) || {
+    category: 'AGENT_TUNNEL',
+    accessMethod: 'UNKNOWN',
+    affectedScope: 'unknown',
+    isIntermittent: false,
+    agentVersion: null,
+    symptoms: [],
+    errorCodes: [],
+    triggerKBFetch: false,
+    kbFetchReason: null
+  };
+}
+
+// ── Stage 2: EVIDENCE EXTRACTION + QUALITY SCORING (Haiku) ─────────────────
+export async function stageEvidenceExtraction(triage, artifacts) {
+  const artifactSummary = Object.entries(artifacts)
+    .filter(([, v]) => v?.content)
+    .map(([k, v]) => `[${k}]\n${v.content.slice(0, 1500)}`)
+    .join('\n\n---\n\n');
+
+  const prompt = `You are extracting evidence from support artifacts for a Cloud SWG ${triage.category} investigation.
+
+ARTIFACTS PROVIDED:
+${artifactSummary || 'No artifacts uploaded yet.'}
+
+Return JSON only:
+{
+  "extractedFacts": [
+    {
+      "fact": "specific finding",
+      "source": "artifact name",
+      "logRef": "specific line or entry reference",
+      "relevance": "HIGH|MEDIUM|LOW",
+      "layer": "ENDPOINT|NETWORK|AUTH|POLICY"
+    }
+  ],
+  "artifactQuality": {
+    "agentLog":  { "present": bool, "usable": bool, "issue": "null or reason not usable" },
+    "proxyLog":  { "present": bool, "usable": bool, "issue": "null or reason not usable" },
+    "accessLog": { "present": bool, "usable": bool, "issue": "null or reason not usable" },
+    "harTrace":  { "present": bool, "usable": bool, "issue": "null or reason not usable" }
+  },
+  "detectedVersions": ["any product versions found in logs"],
+  "detectedTimestamp": "earliest timestamp found or null",
+  "elffFindings": {
+    "deniedRequests": 0,
+    "failedRequests": 0,
+    "dominantCategory": "null or category name",
+    "actionResults": []
+  }
+}`;
+
+  const raw = await ai(HAIKU, CLOUD_SWG_METHODOLOGY, prompt, 800);
+  return parseJSON(raw) || { extractedFacts: [], artifactQuality: {}, detectedVersions: [], elffFindings: {} };
+}
+
+// ── Stage 3: MISSING EVIDENCE DETECTION (Haiku) ────────────────────────────
+export async function stageMissingEvidence(triage, evidenceResult) {
+  const required = EVIDENCE_REQUIREMENTS[triage.category]?.required || [];
+  const quality = evidenceResult.artifactQuality || {};
+
+  const missing = required.filter(r => !quality[r]?.present);
+  const unusable = required.filter(r => quality[r]?.present && !quality[r]?.usable);
+
+  const prompt = `Cloud SWG ${triage.category} investigation.
+Required artifacts: ${required.join(', ')}
+Missing: ${missing.join(', ') || 'none'}
+Present but unusable: ${unusable.join(', ') || 'none'}
+Quality issues: ${JSON.stringify(quality)}
+
+Return JSON only:
+{
+  "investigationStatus": "COMPLETE|INCOMPLETE",
+  "missingArtifacts": [
+    {
+      "artifact": "name",
+      "why": "why it's needed for this investigation",
+      "howToCollect": "exact instruction for customer"
+    }
+  ],
+  "unusableArtifacts": [
+    {
+      "artifact": "name",
+      "issue": "what's wrong",
+      "fix": "what to recollect"
+    }
+  ],
+  "canProceed": bool,
+  "blockerReason": "null or reason cannot proceed"
+}`;
+
+  const raw = await ai(HAIKU, CLOUD_SWG_METHODOLOGY, prompt, 500);
+  return parseJSON(raw) || { investigationStatus: 'INCOMPLETE', missingArtifacts: [], unusableArtifacts: [], canProceed: false };
+}
+
+// ── Stage 4: HYPOTHESIS GENERATION (Sonnet — reasoning) ────────────────────
+export async function stageHypothesisGeneration(triage, evidenceResult, kbContext) {
+  const facts = evidenceResult.extractedFacts?.map(f =>
+    `[${f.layer}] ${f.fact} (source: ${f.source}, ref: ${f.logRef})`
+  ).join('\n') || 'No facts extracted yet.';
+
+  const prompt = `Cloud SWG ${triage.category} investigation.
+Access method: ${triage.accessMethod}
+Affected scope: ${triage.affectedScope}
+Symptoms: ${triage.symptoms?.join(', ')}
+Error codes: ${triage.errorCodes?.join(', ')}
+
+EXTRACTED FACTS:
+${facts}
+
+KB CONTEXT:
+${kbContext || 'No KB articles fetched yet.'}
+
+Generate hypotheses covering all 4 isolation layers. Return JSON only:
+{
+  "hypotheses": [
+    {
+      "id": "H1",
+      "layer": "ENDPOINT|NETWORK|AUTH|POLICY",
+      "hypothesis": "specific proposed cause",
+      "confidence": 0-100,
+      "supportingFacts": ["fact references"],
+      "contradictingFacts": ["any facts that argue against this"],
+      "validationSteps": ["how to confirm or rule out"],
+      "requiredEvidence": ["what evidence would confirm this"]
+    }
+  ],
+  "primaryHypothesis": "H1",
+  "analysisNotes": "overall assessment"
+}`;
+
+  const raw = await ai(SONNET, CLOUD_SWG_METHODOLOGY, prompt, 1200);
+  return parseJSON(raw) || { hypotheses: [], primaryHypothesis: null, analysisNotes: '' };
+}
+
+// ── Stage 5: HYPOTHESIS VALIDATION + CONTRADICTION CHECK (Sonnet) ──────────
+export async function stageValidation(hypotheses, evidenceResult, triage) {
+  const hyps = hypotheses.hypotheses?.map(h =>
+    `${h.id}: ${h.hypothesis} (confidence: ${h.confidence}%, layer: ${h.layer})`
+  ).join('\n') || '';
+
+  const facts = evidenceResult.extractedFacts?.map(f =>
+    `[${f.layer}] ${f.fact} (${f.source})`
+  ).join('\n') || '';
+
+  const prompt = `Validate hypotheses and actively search for contradictions.
+
+HYPOTHESES:
+${hyps}
+
+ALL EVIDENCE:
+${facts}
+
+ELFF findings: ${JSON.stringify(evidenceResult.elffFindings)}
+
+For each hypothesis: validate it, look for contradictions, adjust confidence.
+Return JSON only:
+{
+  "validatedHypotheses": [
+    {
+      "id": "H1",
+      "validated": true|false,
+      "adjustedConfidence": 0-100,
+      "validationEvidence": ["specific evidence supporting"],
+      "contradictions": ["specific evidence contradicting"],
+      "verdict": "CONFIRMED|RULED_OUT|PARTIAL|INSUFFICIENT_EVIDENCE"
+    }
+  ],
+  "primaryCause": "H1 or null",
+  "alternativeCauses": ["H2", "H3"],
+  "overallConfidence": 0-100,
+  "contradictionFound": true|false,
+  "contradictionDetail": "null or what contradicts the primary cause"
+}`;
+
+  const raw = await ai(SONNET, CLOUD_SWG_METHODOLOGY, prompt, 1000);
+  return parseJSON(raw) || { validatedHypotheses: [], primaryCause: null, overallConfidence: 0 };
+}
+
+// ── Stage 6: RCA GENERATION (Sonnet) ───────────────────────────────────────
+export async function stageRCA(triage, evidenceResult, hypotheses, validation, kbContext) {
+  const confidence = validation.overallConfidence || 0;
+
+  if (confidence < 50) {
+    return {
+      status: 'INCOMPLETE',
+      reason: `Confidence too low (${confidence}%) — insufficient evidence to conclude`,
+      confidence,
+      draft: true
+    };
+  }
+
+  const prompt = `Generate a Tier 3 Root Cause Analysis for this Cloud SWG ${triage.category} investigation.
+
+TRIAGE: ${JSON.stringify(triage)}
+PRIMARY CAUSE: ${validation.primaryCause} — ${hypotheses.hypotheses?.find(h => h.id === validation.primaryCause)?.hypothesis}
+CONFIDENCE: ${confidence}%
+ALTERNATIVES EVALUATED: ${validation.alternativeCauses?.join(', ')}
+CONTRADICTION: ${validation.contradictionDetail || 'None found'}
+KB CONTEXT: ${kbContext || 'None fetched'}
+
+Return JSON only:
+{
+  "status": "COMPLETE|DRAFT",
+  "summary": "one paragraph executive summary",
+  "rootCause": "precise technical root cause statement",
+  "timeline": "chronological sequence of events",
+  "evidence": "specific log references and findings supporting this conclusion",
+  "alternativesEvaluated": "what else was considered and why ruled out",
+  "resolution": "step-by-step resolution with exact configuration steps",
+  "validation": "how to confirm the fix worked",
+  "preventionSteps": "how to prevent recurrence",
+  "kbRef": "relevant KB article or TechDoc URL",
+  "confidence": ${confidence},
+  "escalateToDefect": true|false,
+  "escalationReason": "null or reason to escalate as potential defect",
+  "draft": ${confidence < 70}
+}`;
+
+  const raw = await ai(SONNET, CLOUD_SWG_METHODOLOGY, prompt, 1500);
+  return parseJSON(raw) || { status: 'DRAFT', confidence, summary: raw };
+}
+
+// ── Stage 7: QUALITY GATE (Haiku — cheap validation) ───────────────────────
+export async function stageQualityGate(rca, validation, missingEvidence) {
+  const prompt = `Validate this RCA meets Tier 3 quality standards.
+
+RCA confidence: ${rca.confidence}%
+Root cause: ${rca.rootCause}
+Evidence cited: ${rca.evidence}
+Alternatives evaluated: ${rca.alternativesEvaluated}
+Missing evidence flagged: ${missingEvidence.missingArtifacts?.length > 0}
+Contradictions found: ${validation.contradictionFound}
+
+Return JSON only:
+{
+  "passed": true|false,
+  "grade": "A|B|C|FAIL",
+  "checks": {
+    "rootCauseEvidenceBacked": true|false,
+    "alternativesEvaluated": true|false,
+    "missingDataIdentified": true|false,
+    "resolutionStepsPresent": true|false,
+    "confidenceAdequate": true|false
+  },
+  "failReasons": [],
+  "recommendation": "PUBLISH|REVIEW|INCOMPLETE"
+}`;
+
+  const raw = await ai(HAIKU, CLOUD_SWG_METHODOLOGY, prompt, 300);
+  return parseJSON(raw) || { passed: false, grade: 'FAIL', recommendation: 'INCOMPLETE' };
+}
+
+// ── MAIN ORCHESTRATOR ───────────────────────────────────────────────────────
+export async function runInvestigation(ticket, artifacts, onProgress) {
+  const investigation = {
+    ticketId: ticket.id,
+    product: 'Cloud SWG',
+    status: 'running',
+    stages: {},
+    kbContext: null,
+    startedAt: Date.now(),
+  };
+
+  try {
+    // Stage 1: Triage
+    onProgress({ stage: 'triage', label: 'Classifying symptom and access method...', pct: 10 });
+    const triage = await stageTriage(ticket);
+    investigation.stages.triage = triage;
+
+    // KB fetch triggered by triage (if warranted)
+    if (triage.triggerKBFetch && triage.category) {
+      onProgress({ stage: 'kb', label: 'Fetching relevant Broadcom KB article...', pct: 18 });
+      const kbUrl = KB_SEARCH_URLS.patterns[triage.category];
+      if (kbUrl) {
+        const kbContent = await fetchKBArticle(kbUrl);
+        investigation.kbContext = kbContent?.slice(0, 2000) || null;
+      }
+    }
+
+    // Pre-process artifacts (zero token cost)
+    onProgress({ stage: 'preprocess', label: 'Pre-processing log files...', pct: 25 });
+    const processedArtifacts = {};
+    for (const [key, artifact] of Object.entries(artifacts)) {
+      if (!artifact?.content) continue;
+      if (key === 'harTrace') {
+        const parsed = preParseHAR(artifact.content);
+        processedArtifacts[key] = { ...artifact, content: JSON.stringify(parsed) };
+      } else if (key === 'accessLog') {
+        processedArtifacts[key] = { ...artifact, content: extractELFFFields(artifact.content) };
+      } else {
+        processedArtifacts[key] = { ...artifact, content: artifact.content.slice(0, 3000) };
+      }
+    }
+
+    // Stage 2: Evidence extraction
+    onProgress({ stage: 'evidence', label: 'Extracting and scoring evidence from logs...', pct: 35 });
+    const evidenceResult = await stageEvidenceExtraction(triage, processedArtifacts);
+    investigation.stages.evidence = evidenceResult;
+
+    // KB fetch triggered by detected version
+    if (!investigation.kbContext && evidenceResult.detectedVersions?.length > 0) {
+      onProgress({ stage: 'kb', label: `Fetching KB for detected version: ${evidenceResult.detectedVersions[0]}...`, pct: 42 });
+      const kbUrl = KB_SEARCH_URLS.patterns[triage.category];
+      if (kbUrl) {
+        const kbContent = await fetchKBArticle(kbUrl);
+        investigation.kbContext = kbContent?.slice(0, 2000) || null;
+      }
+    }
+
+    // Stage 3: Missing evidence detection
+    onProgress({ stage: 'missing', label: 'Checking for missing critical evidence...', pct: 50 });
+    const missingEvidence = await stageMissingEvidence(triage, evidenceResult);
+    investigation.stages.missingEvidence = missingEvidence;
+
+    // Stage 4: Hypothesis generation
+    onProgress({ stage: 'hypotheses', label: 'Generating hypotheses across all 4 isolation layers...', pct: 62 });
+    const hypotheses = await stageHypothesisGeneration(triage, evidenceResult, investigation.kbContext);
+    investigation.stages.hypotheses = hypotheses;
+
+    // Stage 5: Validation + contradiction check
+    onProgress({ stage: 'validation', label: 'Validating hypotheses and checking for contradictions...', pct: 74 });
+    const validation = await stageValidation(hypotheses, evidenceResult, triage);
+    investigation.stages.validation = validation;
+
+    // Stage 6: RCA generation
+    onProgress({ stage: 'rca', label: 'Generating Tier 3 Root Cause Analysis...', pct: 85 });
+    const rca = await stageRCA(triage, evidenceResult, hypotheses, validation, investigation.kbContext);
+    investigation.stages.rca = rca;
+
+    // Stage 7: Quality gate
+    onProgress({ stage: 'gate', label: 'Running RCA quality gate...', pct: 95 });
+    const qualityGate = await stageQualityGate(rca, validation, missingEvidence);
+    investigation.stages.qualityGate = qualityGate;
+
+    investigation.status = qualityGate.passed ? 'complete' : 'review';
+    investigation.completedAt = Date.now();
+    onProgress({ stage: 'done', label: 'Investigation complete', pct: 100 });
+
+    return investigation;
+
+  } catch (error) {
+    investigation.status = 'error';
+    investigation.error = error.message;
+    onProgress({ stage: 'error', label: `Error: ${error.message}`, pct: 0 });
+    return investigation;
+  }
+}
